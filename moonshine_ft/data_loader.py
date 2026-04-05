@@ -13,6 +13,8 @@ from typing import Optional, Union, Dict, Any
 import pandas as pd
 from pathlib import Path
 
+from moonshine_ft.utils.preprocessing import normalize_audio
+
 
 class MoonshineDataLoader:
     """
@@ -145,6 +147,19 @@ class MoonshineDataLoader:
         # Read CSVs
         train_df = pd.read_csv(train_csv)
         test_df = pd.read_csv(test_csv)
+
+        audio_column = self._resolve_column_name(
+            train_df.columns,
+            preferred=audio_column,
+            candidates=["audio", "audio_path", "path", "file", "filepath"],
+            column_kind="audio"
+        )
+        text_column = self._resolve_column_name(
+            train_df.columns,
+            preferred=text_column,
+            candidates=["sentence", "transcript", "transcription", "text"],
+            column_kind="text"
+        )
 
         # Adjust paths if base_path provided
         if base_path:
@@ -327,11 +342,18 @@ class MoonshineDataLoader:
             print(f"  Train samples: {len(dataset['train']):,}")
             print(f"  Test samples: {len(dataset['test']):,}")
 
+            resolved_text_column = self._resolve_column_name(
+                dataset["train"].column_names,
+                preferred=text_column,
+                candidates=["sentence", "transcript", "transcription", "text"],
+                column_kind="text"
+            )
+
             # Rename text column if needed
-            if text_column != "sentence" and text_column in dataset["train"].column_names:
+            if resolved_text_column != "sentence":
                 dataset = DatasetDict({
-                    "train": dataset["train"].rename_column(text_column, "sentence"),
-                    "test": dataset["test"].rename_column(text_column, "sentence")
+                    "train": dataset["train"].rename_column(resolved_text_column, "sentence"),
+                    "test": dataset["test"].rename_column(resolved_text_column, "sentence")
                 })
 
         else:
@@ -349,6 +371,37 @@ class MoonshineDataLoader:
             )
 
         return dataset
+
+    def _resolve_column_name(
+        self,
+        columns,
+        preferred: str,
+        candidates,
+        column_kind: str
+    ) -> str:
+        """
+        Resolve a column name from a preferred value plus common fallbacks.
+
+        This keeps the training path friendly to plain datasets whose columns
+        are named ``text``/``transcription`` instead of the repo's internal
+        ``sentence`` convention.
+        """
+        if preferred in columns:
+            return preferred
+
+        for candidate in candidates:
+            if candidate in columns:
+                print(
+                    f"  [INFO] Using {column_kind} column '{candidate}' "
+                    f"(requested '{preferred}' was not found)"
+                )
+                return candidate
+
+        raise ValueError(
+            f"Could not find a {column_kind} column. "
+            f"Tried '{preferred}' and fallbacks {candidates}. "
+            f"Available columns: {list(columns)}"
+        )
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> 'MoonshineDataLoader':
@@ -430,12 +483,20 @@ class MoonshineDataLoader:
         Returns:
             Processed dataset with input_values, labels, and duration
         """
+        preprocessing_config = self.config.get('preprocessing', {})
+        should_normalize = preprocessing_config.get('normalize_audio', False)
+        target_rms = preprocessing_config.get('target_rms', 0.075)
+
         def prepare_example(batch):
             # Process audio
             audio = batch["audio"]
+            audio_array = audio["array"]
+
+            if should_normalize:
+                audio_array = normalize_audio(audio_array, target_rms=target_rms)
 
             inputs = processor(
-                audio["array"],
+                audio_array,
                 sampling_rate=audio["sampling_rate"],
                 return_tensors="pt"
             )
@@ -449,8 +510,8 @@ class MoonshineDataLoader:
             batch["labels"] = labels + [2]  # Add EOS token
 
             # Store audio duration for curriculum filtering and length bucketing
-            batch["duration"] = len(audio["array"]) / audio["sampling_rate"]
-            batch["input_length"] = len(audio["array"])
+            batch["duration"] = len(audio_array) / audio["sampling_rate"]
+            batch["input_length"] = len(audio_array)
 
             return batch
 
@@ -483,6 +544,19 @@ class MoonshineDataLoader:
         Returns:
             Filtered dataset
         """
+        if 'duration' not in dataset.column_names and 'audio_duration' not in dataset.column_names:
+            print("\nNo duration column found. Computing durations from audio...")
+
+            def add_duration(example):
+                audio = example["audio"]
+                example["duration"] = len(audio["array"]) / audio["sampling_rate"]
+                return example
+
+            dataset = dataset.map(
+                add_duration,
+                num_proc=self.config.get('preprocessing', {}).get('num_proc', 4)
+            )
+
         # Determine which duration column exists
         duration_col = 'duration' if 'duration' in dataset.column_names else 'audio_duration'
 
