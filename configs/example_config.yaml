@@ -4,6 +4,11 @@
 # =============================================================================
 # DATASET CONFIGURATION
 # =============================================================================
+storage:
+  # Optional: set a shared scratch root so relative caches, logs, and results
+  # land outside your home directory
+  root_dir: null  # e.g. "/scratch/cjh9fw/moonshine"
+
 dataset:
   # HuggingFace dataset name or path to local dataset
   name: "facebook/multilingual_librispeech"
@@ -31,6 +36,7 @@ model:
   name: "UsefulSensors/moonshine-tiny"  # or path to local model
 
   # Optional: Cache directory for downloading models
+  # If storage.root_dir is set, relative paths resolve under it
   cache_dir: null
 
   # Optional: Resume from checkpoint
@@ -41,6 +47,7 @@ model:
 # =============================================================================
 training:
   # Output directory for checkpoints and logs
+  # If storage.root_dir is set, relative paths resolve under it
   output_dir: "./results-moonshine-fr"
 
   # Number of training epochs
@@ -61,6 +68,7 @@ training:
 
   # Logging frequency
   logging_steps: 50
+  # If storage.root_dir is set, relative paths resolve under it
   logging_dir: "runs"
 
   # Evaluation frequency

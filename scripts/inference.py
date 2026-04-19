@@ -44,7 +44,7 @@ from tqdm import tqdm
 try:
     import sounddevice as sd
     SOUNDDEVICE_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     SOUNDDEVICE_AVAILABLE = False
     sd = None
 
@@ -110,6 +110,114 @@ def normalize_audio(audio_data: np.ndarray, target_rms: float = 0.075) -> np.nda
         normalized = audio_data * scale_factor
         return np.clip(normalized, -1.0, 1.0)
     return audio_data
+
+
+def prepare_audio_input(
+    audio: Union[np.ndarray, Path, str],
+    sampling_rate: int = 16000
+) -> tuple[np.ndarray, float]:
+    """
+    Resolve path/array audio input into a mono float32 waveform and duration.
+    """
+    if isinstance(audio, (str, Path)):
+        audio_path = Path(audio)
+        audio_array = load_audio(audio_path, target_sr=sampling_rate)
+    else:
+        audio_array = np.asarray(audio, dtype=np.float32)
+        audio_array = np.squeeze(audio_array)
+        if audio_array.ndim > 1:
+            channel_axis = 0 if audio_array.shape[0] <= audio_array.shape[-1] else -1
+            audio_array = audio_array.mean(axis=channel_axis)
+
+    audio_array = np.asarray(audio_array, dtype=np.float32)
+    audio_duration = len(audio_array) / sampling_rate
+    return audio_array, audio_duration
+
+
+def transcribe_with_sliding_windows(
+    pipeline,
+    audio: Union[np.ndarray, Path, str],
+    sampling_rate: int = 16000,
+    window_seconds: float = 5.0,
+    stride_seconds: Optional[float] = None,
+    min_window_seconds: float = 0.5,
+    **kwargs
+) -> Dict:
+    """
+    Transcribe long audio by running simple fixed-size windows and concatenating text.
+
+    This is intentionally simple and does not deduplicate overlap. It is useful for
+    quickly checking whether full-context decoding is the source of hallucinations.
+    """
+    if window_seconds <= 0:
+        raise ValueError("window_seconds must be > 0")
+
+    if stride_seconds is None:
+        stride_seconds = window_seconds
+
+    if stride_seconds <= 0:
+        raise ValueError("stride_seconds must be > 0")
+
+    audio_array, audio_duration = prepare_audio_input(audio, sampling_rate=sampling_rate)
+    total_samples = len(audio_array)
+    if total_samples == 0:
+        raise ValueError("Audio is empty")
+
+    window_samples = max(1, int(round(window_seconds * sampling_rate)))
+    stride_samples = max(1, int(round(stride_seconds * sampling_rate)))
+
+    if total_samples <= window_samples:
+        start_samples = [0]
+    else:
+        max_start = total_samples - window_samples
+        start_samples = list(range(0, max_start + 1, stride_samples))
+        if start_samples[-1] != max_start:
+            start_samples.append(max_start)
+
+    segments = []
+    combined_text_parts = []
+    total_inference_time = 0.0
+
+    for segment_index, start_sample in enumerate(start_samples):
+        end_sample = min(start_sample + window_samples, total_samples)
+        chunk = audio_array[start_sample:end_sample]
+        chunk_duration = len(chunk) / sampling_rate
+
+        if chunk_duration < min_window_seconds and segments:
+            continue
+
+        result = pipeline.transcribe(
+            chunk,
+            sampling_rate=sampling_rate,
+            **kwargs
+        )
+        segment_text = result.get("text", "").strip()
+        total_inference_time += result.get("inference_time", 0.0)
+
+        segments.append({
+            "index": segment_index,
+            "start_time": start_sample / sampling_rate,
+            "end_time": end_sample / sampling_rate,
+            "audio_duration": chunk_duration,
+            "inference_time": result.get("inference_time", 0.0),
+            "rtf": result.get("rtf", 0.0),
+            "text": segment_text,
+        })
+
+        if segment_text:
+            combined_text_parts.append(segment_text)
+
+    combined_text = " ".join(combined_text_parts).strip()
+
+    return {
+        "text": combined_text,
+        "audio_duration": audio_duration,
+        "inference_time": total_inference_time,
+        "rtf": total_inference_time / audio_duration if audio_duration > 0 else 0.0,
+        "window_seconds": window_seconds,
+        "stride_seconds": stride_seconds,
+        "segments": segments,
+    }
 
 
 class ManualONNXInference:
@@ -741,6 +849,16 @@ Examples:
         type=int,
         help='Maximum tokens to generate (default: auto based on duration)'
     )
+    parser.add_argument(
+        '--window-seconds',
+        type=float,
+        help='Optional fixed window size for simple sliding-window transcription'
+    )
+    parser.add_argument(
+        '--window-stride-seconds',
+        type=float,
+        help='Optional stride for sliding-window transcription (default: same as window size)'
+    )
 
     # Live mode arguments
     parser.add_argument(
@@ -895,18 +1013,37 @@ Examples:
     if audio_path.is_file():
         # Single file
         print(f"\nTranscribing: {audio_path}")
-        result = pipeline.transcribe(
-            audio_path,
-            num_beams=args.num_beams,
-            repetition_penalty=args.repetition_penalty,
-            no_repeat_ngram_size=args.no_repeat_ngram_size,
-            max_new_tokens=args.max_new_tokens
-        )
+        if args.window_seconds:
+            result = transcribe_with_sliding_windows(
+                pipeline,
+                audio_path,
+                window_seconds=args.window_seconds,
+                stride_seconds=args.window_stride_seconds,
+                num_beams=args.num_beams,
+                repetition_penalty=args.repetition_penalty,
+                no_repeat_ngram_size=args.no_repeat_ngram_size,
+                max_new_tokens=args.max_new_tokens
+            )
+        else:
+            result = pipeline.transcribe(
+                audio_path,
+                num_beams=args.num_beams,
+                repetition_penalty=args.repetition_penalty,
+                no_repeat_ngram_size=args.no_repeat_ngram_size,
+                max_new_tokens=args.max_new_tokens
+            )
 
         print(f"\nTranscription: {result['text']}")
         print(f"Audio duration: {result['audio_duration']:.2f}s")
         print(f"Inference time: {result['inference_time']:.2f}s")
         print(f"Real-time factor: {result['rtf']:.2f}x")
+        if 'segments' in result:
+            print("\nWindowed segments:")
+            for segment in result['segments']:
+                print(
+                    f"[{segment['start_time']:.2f}s - {segment['end_time']:.2f}s] "
+                    f"{segment['text']}"
+                )
 
         results = [result]
         results[0]['file'] = str(audio_path)
@@ -926,13 +1063,38 @@ Examples:
 
         print(f"\nFound {len(audio_files)} audio files")
 
-        results = pipeline.transcribe_batch(
-            audio_files,
-            num_beams=args.num_beams,
-            repetition_penalty=args.repetition_penalty,
-            no_repeat_ngram_size=args.no_repeat_ngram_size,
-            max_new_tokens=args.max_new_tokens
-        )
+        if args.window_seconds:
+            results = []
+            iterator = tqdm(audio_files, desc="Transcribing")
+            for file_path in iterator:
+                try:
+                    result = transcribe_with_sliding_windows(
+                        pipeline,
+                        file_path,
+                        window_seconds=args.window_seconds,
+                        stride_seconds=args.window_stride_seconds,
+                        num_beams=args.num_beams,
+                        repetition_penalty=args.repetition_penalty,
+                        no_repeat_ngram_size=args.no_repeat_ngram_size,
+                        max_new_tokens=args.max_new_tokens
+                    )
+                    result['file'] = str(file_path)
+                    results.append(result)
+                except Exception as e:
+                    print(f"\nError processing {file_path}: {e}")
+                    results.append({
+                        'file': str(file_path),
+                        'text': '',
+                        'error': str(e)
+                    })
+        else:
+            results = pipeline.transcribe_batch(
+                audio_files,
+                num_beams=args.num_beams,
+                repetition_penalty=args.repetition_penalty,
+                no_repeat_ngram_size=args.no_repeat_ngram_size,
+                max_new_tokens=args.max_new_tokens
+            )
 
         # Print summary
         print(f"\n{'='*60}")

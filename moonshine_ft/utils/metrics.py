@@ -2,9 +2,17 @@
 Evaluation metrics for ASR models.
 """
 
+import os
 import evaluate
 import numpy as np
 from typing import List, Tuple
+
+
+def _load_metric(metric_name: str):
+    return evaluate.load(
+        metric_name,
+        cache_dir=os.environ.get("HF_EVALUATE_CACHE")
+    )
 
 
 def compute_wer(predictions: List[str], references: List[str]) -> float:
@@ -18,7 +26,7 @@ def compute_wer(predictions: List[str], references: List[str]) -> float:
     Returns:
         WER as a percentage (0-100)
     """
-    metric = evaluate.load('wer')
+    metric = _load_metric('wer')
 
     # Handle empty strings
     pred_empty = np.array([p.strip() == "" for p in predictions])
@@ -50,7 +58,7 @@ def compute_cer(predictions: List[str], references: List[str]) -> float:
     Returns:
         CER as a percentage (0-100)
     """
-    metric = evaluate.load('cer')
+    metric = _load_metric('cer')
 
     # Handle empty strings
     pred_empty = np.array([p.strip() == "" for p in predictions])
@@ -89,7 +97,7 @@ def compute_detailed_metrics(
     cer = compute_cer(predictions, references)
 
     # Compute per-sample WER
-    wer_metric = evaluate.load('wer')
+    wer_metric = _load_metric('wer')
     individual_wers = []
     for pred, ref in zip(predictions, references):
         if ref.strip() == "" and pred.strip() == "":

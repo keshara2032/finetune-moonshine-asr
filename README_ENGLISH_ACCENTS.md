@@ -2,7 +2,7 @@
 
 This guide shows the simplest way to fine-tune the base English Moonshine model on a new English dataset with different accents.
 
-It is written for the config in [configs/english_accent_local_no_curriculum.yaml](/mnt/f/repos/finetune-moonshine-asr/configs/english_accent_local_no_curriculum.yaml).
+It is written for the config in [configs/english_accent_local_no_curriculum.yaml](configs/english_accent_local_no_curriculum.yaml).
 
 ## What The Training Expects
 
@@ -26,27 +26,34 @@ You do not need to manually create a `duration` column.
 ## Recommended Folder Layout
 
 ```text
-finetune-moonshine-asr/
-├── data/
-│   └── english_accents_split/
-│       ├── dataset_dict.json
-│       ├── train/
-│       └── test/
-├── configs/
-│   └── english_accent_local_no_curriculum.yaml
-└── train.py
+/scratch/cjh9fw/moonshine/
+├── cache/
+├── logs/
+│   └── moonshine-en-accents/
+└── results/
+    └── moonshine-en-accents/
+```
+
+```text
+/scratch/cjh9fw/finetune-moonshine-asr/
+├── dataset_dict.json
+├── train/
+└── test/
 ```
 
 The default config already points to:
 
 ```yaml
+storage:
+  root_dir: "/scratch/cjh9fw/moonshine"
+
 dataset:
   type: "local"
-  path: "./data/english_accents_split"
+  path: "/scratch/cjh9fw/finetune-moonshine-asr"
   text_column: "text"
 ```
 
-If your dataset lives somewhere else, just change `dataset.path`.
+If your dataset lives somewhere else, change `dataset.path` to that absolute path.
 
 ## Create The Dataset
 
@@ -78,7 +85,7 @@ dataset_dict = DatasetDict({
     "test": split_dataset["test"],
 })
 
-dataset_dict.save_to_disk("./data/english_accents_split")
+dataset_dict.save_to_disk("/scratch/cjh9fw/finetune-moonshine-asr")
 ```
 
 ### Option 2: From Audio Files + A Transcript File
@@ -113,7 +120,7 @@ dataset_dict = DatasetDict({
     "test": split_dataset["test"],
 })
 
-dataset_dict.save_to_disk("./data/english_accents_split")
+dataset_dict.save_to_disk("/scratch/cjh9fw/finetune-moonshine-asr")
 ```
 
 ## Audio And Transcript Guidelines
@@ -161,8 +168,9 @@ That will:
 - load `UsefulSensors/moonshine-tiny`
 - load your local dataset
 - preprocess audio and text
-- save checkpoints to `./results-moonshine-en-accents`
-- save the final model to `./results-moonshine-en-accents/final`
+- cache Hugging Face downloads in `/scratch/cjh9fw/moonshine/cache`
+- save checkpoints to `/scratch/cjh9fw/moonshine/results/moonshine-en-accents`
+- save the final model to `/scratch/cjh9fw/moonshine/results/moonshine-en-accents/final`
 
 ## Evaluate The Model
 
@@ -170,13 +178,22 @@ After training finishes:
 
 ```bash
 python scripts/evaluate.py \
-  --model ./results-moonshine-en-accents/final \
-  --dataset ./data/english_accents_split \
+  --model /scratch/cjh9fw/moonshine/results/moonshine-en-accents/final \
+  --dataset /scratch/cjh9fw/finetune-moonshine-asr \
   --split test \
   --text-column text
 ```
 
 If your original dataset uses `transcript` or `transcription` instead of `text`, change `--text-column`.
+
+For a simpler test-set report with timestamped outputs under `./results/`:
+
+```bash
+python scripts/test_model.py --model-source base
+python scripts/test_model.py --model-source finetuned
+```
+
+That script uses the current English config and test split by default, prints WER/CER plus common word mistakes, and saves JSON + Markdown reports in the repo `results/` folder.
 
 ## Run Inference
 
@@ -184,7 +201,7 @@ For a single audio file:
 
 ```bash
 python scripts/inference.py \
-  --model ./results-moonshine-en-accents/final \
+  --model /scratch/cjh9fw/moonshine/results/moonshine-en-accents/final \
   --audio ./sample.wav
 ```
 
@@ -192,11 +209,12 @@ python scripts/inference.py \
 
 The main file to edit is:
 
-[configs/english_accent_local_no_curriculum.yaml](/mnt/f/repos/finetune-moonshine-asr/configs/english_accent_local_no_curriculum.yaml)
+[configs/english_accent_local_no_curriculum.yaml](configs/english_accent_local_no_curriculum.yaml)
 
 Common changes:
 
-- `dataset.path`: where your saved `DatasetDict` lives
+- `storage.root_dir`: shared scratch location for caches, logs, and results
+- `dataset.path`: absolute path to your saved `DatasetDict`
 - `dataset.text_column`: your transcript column name
 - `audio.min_duration` / `audio.max_duration`: filter very short or very long clips
 - `training.per_device_train_batch_size`: lower this if you run out of GPU memory
@@ -218,12 +236,12 @@ Check these first:
 python train.py --config configs/english_accent_local_no_curriculum.yaml
 
 python scripts/evaluate.py \
-  --model ./results-moonshine-en-accents/final \
-  --dataset ./data/english_accents_split \
+  --model /scratch/cjh9fw/moonshine/results/moonshine-en-accents/final \
+  --dataset /scratch/cjh9fw/finetune-moonshine-asr \
   --split test \
   --text-column text
 
 python scripts/inference.py \
-  --model ./results-moonshine-en-accents/final \
+  --model /scratch/cjh9fw/moonshine/results/moonshine-en-accents/final \
   --audio ./sample.wav
 ```

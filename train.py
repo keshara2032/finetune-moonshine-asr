@@ -39,6 +39,7 @@ from transformers import (
 
 from moonshine_ft.data_loader import MoonshineDataLoader
 from moonshine_ft.curriculum import CurriculumScheduler
+from moonshine_ft.storage import configure_storage, resolve_path
 
 
 def parse_args():
@@ -230,6 +231,107 @@ class MoonshineSeq2SeqTrainer(Seq2SeqTrainer):
         return (loss, generated_tokens, labels)
 
 
+def get_duration_column(dataset):
+    """Return the available duration column name for a dataset split."""
+    for column_name in ("duration", "audio_duration"):
+        if column_name in dataset.column_names:
+            return column_name
+    return None
+
+
+def summarize_duration_profile(dataset):
+    """Compute duration statistics used to size batches sanely."""
+    duration_column = get_duration_column(dataset)
+    if duration_column is None:
+        return None
+
+    durations = np.asarray(dataset[duration_column], dtype=np.float32)
+    if durations.size == 0:
+        return None
+
+    return {
+        "count": int(durations.size),
+        "min": float(np.min(durations)),
+        "mean": float(np.mean(durations)),
+        "median": float(np.median(durations)),
+        "p90": float(np.percentile(durations, 90)),
+        "p95": float(np.percentile(durations, 95)),
+        "max": float(np.max(durations)),
+        "under_30": int(np.sum(durations <= 30.0)),
+        "under_60": int(np.sum(durations <= 60.0)),
+        "under_90": int(np.sum(durations <= 90.0)),
+    }
+
+
+def tune_training_config_for_duration(train_config, duration_profile):
+    """
+    Downshift batch settings automatically when the dataset contains long-form audio.
+
+    Moonshine's processor keeps raw-waveform length in `input_values`, so extremely long
+    clips combined with large per-device batches make the first training step look hung.
+    """
+    if duration_profile is None:
+        return dict(train_config), []
+
+    adjusted = dict(train_config)
+    notes = []
+
+    long_audio_detected = (
+        duration_profile["p90"] > 45.0 or
+        duration_profile["mean"] > 30.0
+    )
+
+    if not long_audio_detected:
+        return adjusted, notes
+
+    target_audio_seconds = float(
+        adjusted.get("max_audio_seconds_per_device_batch", 180.0)
+    )
+    safe_train_batch = max(1, int(target_audio_seconds // max(duration_profile["p90"], 1.0)))
+    safe_eval_batch = max(1, int(target_audio_seconds // max(duration_profile["p95"], 1.0)))
+
+    if adjusted["per_device_train_batch_size"] > safe_train_batch:
+        notes.append(
+            "Long-form audio detected; reducing per-device train batch size "
+            f"from {adjusted['per_device_train_batch_size']} to {safe_train_batch}."
+        )
+        adjusted["per_device_train_batch_size"] = safe_train_batch
+
+    if adjusted["per_device_eval_batch_size"] > safe_eval_batch:
+        notes.append(
+            "Long-form audio detected; reducing per-device eval batch size "
+            f"from {adjusted['per_device_eval_batch_size']} to {safe_eval_batch}."
+        )
+        adjusted["per_device_eval_batch_size"] = safe_eval_batch
+
+    max_long_audio_grad_accum = int(
+        adjusted.get("max_long_audio_gradient_accumulation_steps", 4)
+    )
+    if adjusted["gradient_accumulation_steps"] > max_long_audio_grad_accum:
+        notes.append(
+            "Long-form audio detected; reducing gradient accumulation steps "
+            f"from {adjusted['gradient_accumulation_steps']} to {max_long_audio_grad_accum} "
+            "so the first optimizer step does not take forever."
+        )
+        adjusted["gradient_accumulation_steps"] = max_long_audio_grad_accum
+
+    if adjusted.get("logging_steps", 1) > 1:
+        notes.append(
+            f"Long-form audio detected; reducing logging_steps from {adjusted['logging_steps']} to 1."
+        )
+        adjusted["logging_steps"] = 1
+
+    adjusted["logging_first_step"] = True
+
+    if duration_profile["under_30"] < 100:
+        notes.append(
+            "This dataset is almost entirely longer than Moonshine's usual 4-30s regime. "
+            "Training can still run with conservative batches, but segmenting the audio would be better."
+        )
+
+    return adjusted, notes
+
+
 def main():
     args = parse_args()
 
@@ -249,6 +351,23 @@ def main():
         config = yaml.safe_load(f)
 
     print(f"\nConfiguration loaded from: {args.config}")
+    train_config = dict(config['training'])
+
+    storage = configure_storage(config)
+    storage_root = Path(storage["storage_root"]) if storage["storage_root"] else None
+
+    if storage_root is not None:
+        print(f"\nStorage root: {storage['storage_root']}")
+        print(f"  Model cache:   {storage['model_cache_dir']}")
+        print(f"  Dataset cache: {storage['dataset_cache_dir']}")
+        print(f"  Metrics cache: {storage['evaluate_cache_dir']}")
+        print(f"  Logging dir:   {storage['logging_dir']}")
+
+        if args.output_dir:
+            args.output_dir = resolve_path(args.output_dir, storage_root)
+
+        if args.resume:
+            args.resume = resolve_path(args.resume, storage_root)
 
     # Override config with command-line arguments
     if args.no_curriculum:
@@ -307,7 +426,10 @@ def main():
     print("\n" + "="*60)
     print("LOADING PROCESSOR")
     print("="*60)
-    processor = AutoProcessor.from_pretrained(model_name)
+    processor = AutoProcessor.from_pretrained(
+        model_name,
+        cache_dir=config['model'].get('cache_dir')
+    )
 
     # Register special tokens
     special_tokens = {
@@ -381,6 +503,48 @@ def main():
             text_column='sentence'
         )
 
+    duration_profile = summarize_duration_profile(dataset_dict['train'])
+    if duration_profile is not None:
+        print(f"\n{'='*60}")
+        print("TRAINING DURATION PROFILE")
+        print(f"{'='*60}")
+        print(
+            "Train durations: "
+            f"min={duration_profile['min']:.1f}s, "
+            f"mean={duration_profile['mean']:.1f}s, "
+            f"median={duration_profile['median']:.1f}s, "
+            f"p90={duration_profile['p90']:.1f}s, "
+            f"p95={duration_profile['p95']:.1f}s, "
+            f"max={duration_profile['max']:.1f}s"
+        )
+        print(
+            "Clips within common Moonshine ranges: "
+            f"<=30s: {duration_profile['under_30']:,}, "
+            f"<=60s: {duration_profile['under_60']:,}, "
+            f"<=90s: {duration_profile['under_90']:,}"
+        )
+
+    train_config, duration_tuning_notes = tune_training_config_for_duration(
+        train_config,
+        duration_profile
+    )
+    if duration_tuning_notes:
+        print(f"\n{'='*60}")
+        print("LONG-AUDIO ADJUSTMENTS")
+        print(f"{'='*60}")
+        for note in duration_tuning_notes:
+            print(f"[WARNING] {note}")
+
+    eval_max_samples = train_config.get('eval_max_samples')
+    if eval_max_samples:
+        original_eval_count = len(dataset_dict['test'])
+        capped_eval_count = min(int(eval_max_samples), original_eval_count)
+        dataset_dict['test'] = dataset_dict['test'].shuffle(seed=42).select(range(capped_eval_count))
+        print(
+            f"\n[INFO] Limiting training-time evaluation to "
+            f"{capped_eval_count:,}/{original_eval_count:,} samples"
+        )
+
     # Check if we have enough data
     if len(dataset_dict['train']) < 10:
         print(f"\n[WARNING] WARNING: Only {len(dataset_dict['train'])} training samples!")
@@ -428,7 +592,10 @@ def main():
     print(f"{'='*60}")
     print(f"Loading from: {model_path}")
 
-    model = MoonshineForConditionalGeneration.from_pretrained(model_path)
+    model = MoonshineForConditionalGeneration.from_pretrained(
+        model_path,
+        cache_dir=config['model'].get('cache_dir')
+    )
 
     # Configure model tokens
     model.config.pad_token_id = 2
@@ -471,7 +638,10 @@ def main():
     # ============================================
     # Evaluation Metrics
     # ============================================
-    wer_metric = evaluate.load('wer')
+    wer_metric = evaluate.load(
+        'wer',
+        cache_dir=storage.get('evaluate_cache_dir')
+    )
 
     def compute_metrics(pred):
         pred_ids = pred.predictions
@@ -517,13 +687,15 @@ def main():
     # ============================================
     # Training Arguments
     # ============================================
-    train_config = config['training']
-
     # Override with phase-specific and CLI args
-    max_steps = args.max_steps or phase.max_steps
-    learning_rate = phase.learning_rate
+    max_steps = args.max_steps or train_config.get('max_steps', phase.max_steps)
+    learning_rate = (
+        phase.learning_rate
+        if config['curriculum']['enabled']
+        else train_config.get('learning_rate', phase.learning_rate)
+    )
 
-    training_args = Seq2SeqTrainingArguments(
+    training_args_kwargs = dict(
         output_dir=output_dir,
 
         # Batch sizes
@@ -540,10 +712,6 @@ def main():
         max_steps=max_steps,
         label_smoothing_factor=phase.label_smoothing,
 
-        # Length bucketing (paper recommendation: groups similar-length audio)
-        group_by_length=train_config['group_by_length'],
-        length_column_name=train_config['length_column_name'],
-
         # Memory optimization
         gradient_checkpointing=train_config['gradient_checkpointing'],
         fp16=train_config['fp16'],
@@ -554,6 +722,7 @@ def main():
         eval_steps=train_config['eval_steps'],
         save_steps=train_config['save_steps'],
         logging_steps=train_config['logging_steps'],
+        logging_first_step=train_config.get('logging_first_step', True),
         predict_with_generate=train_config['predict_with_generate'],
 
         # Model selection
@@ -572,6 +741,19 @@ def main():
         # Run name
         run_name=f"moonshine_phase{args.phase}" if config['curriculum']['enabled'] else "moonshine_full",
     )
+
+    # Transformers renamed this API from `group_by_length` to
+    # `train_sampling_strategy="group_by_length"` in newer versions.
+    if "group_by_length" in Seq2SeqTrainingArguments.__dataclass_fields__:
+        training_args_kwargs["group_by_length"] = train_config['group_by_length']
+    else:
+        training_args_kwargs["train_sampling_strategy"] = (
+            "group_by_length" if train_config['group_by_length'] else "random"
+        )
+
+    training_args_kwargs["length_column_name"] = train_config['length_column_name']
+
+    training_args = Seq2SeqTrainingArguments(**training_args_kwargs)
 
     # ============================================
     # Initialize Trainer
