@@ -24,8 +24,8 @@ dataset:
 
 audio:
   sampling_rate: 16000
-  max_duration: 180.0
-  min_duration: 5.0
+  max_duration: 20.0
+  min_duration: 4.0
 
 preprocessing:
   num_proc: 4
@@ -38,30 +38,30 @@ curriculum:
 training:
   output_dir: "results/moonshine-en-accents"
 
-  per_device_train_batch_size: 1
-  per_device_eval_batch_size: 1
-  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 16
   gradient_checkpointing: true
   fp16: true
   fp16_full_eval: true
   group_by_length: true
   length_column_name: "input_length"
   max_grad_norm: 1.0
-  max_audio_seconds_per_device_batch: 180.0
-  max_long_audio_gradient_accumulation_steps: 4
-  eval_max_samples: 100
+  max_audio_seconds_per_device_batch: 80.0
+  max_long_audio_gradient_accumulation_steps: 16
+  eval_max_samples: 5000
 
-  max_steps: 6000
+  max_steps: 8000
 
   optim: "schedule_free_adamw"
-  learning_rate: 1.0e-4
+  learning_rate: 3.0e-4
   lr_scheduler_type: "constant_with_warmup"
-  warmup_steps: 300
+  warmup_steps: 256
 
   eval_strategy: "steps"
   eval_steps: 500
   save_steps: 500
-  logging_steps: 1
+  logging_steps: 50
   predict_with_generate: true
 
   load_best_model_at_end: true
@@ -81,6 +81,6 @@ generation:
   length_penalty: 1.2
   do_sample: false
   early_stopping: true
-  repetition_penalty: 1.2
+  repetition_penalty: 1.3
   num_beams: 5
   no_repeat_ngram_size: 2
